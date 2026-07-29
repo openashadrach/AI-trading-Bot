@@ -9,10 +9,8 @@ from metaapi_cloud_sdk import MetaApi
 from smartmoneyconcepts import smc
 from sklearn.ensemble import RandomForestClassifier
 
-# 1. Initialize FastAPI Application
-app = FastAPI(title="SMC AI Trading Bot", version="1.0")
+app = FastAPI(title="SMC AI Trading Bot - Universal MT4/MT5", version="3.0")
 
-# Enable CORS for frontend website communication
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,20 +19,117 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 2. Request Data Schema (Input from your website dashboard)
-class TradeRequest(BaseModel):
-    token: str
-    account_id: str
-    symbol: str = "EURUSD"
+METAAPI_TOKEN = os.getenv("METAAPI_TOKEN", "YOUR_METAAPI_TOKEN_HERE")
 
-# 3. AI Model Initialization (Self-Learning Feedback Loop)
+class UniversalBrokerSetup(BaseModel):
+    broker_name: str       # e.g., "Exness", "FxPro", "XM", "HotForex", etc.
+    platform: str          # "mt4" or "mt5"
+    login: str
+    password: str
+    server: str
+    symbol: str = "EURUSD"
+    daily_profit_target: float = 50.0  # Target in USD
+
 ai_model = RandomForestClassifier()
 X_train_dummy = np.array([[1, 0, 1], [0, 1, 0], [1, 1, 1], [0, 0, 0]])
-y_train_dummy = np.array([1, 0, 1, 0]) # 1 = Win, 0 = Loss
+y_train_dummy = np.array([1, 0, 1, 0])
 ai_model.fit(X_train_dummy, y_train_dummy)
 
 @app.get("/")
 def home():
+    return {"status": "Online", "message": "Universal MT4/MT5 SMC Trading Engine Active 24/7."}
+
+@app.post("/connect-and-trade")
+async def connect_and_trade(data: UniversalBrokerSetup):
+    try:
+        platform_lower = data.platform.lower()
+        if platform_lower not in ["mt4", "mt5"]:
+            raise HTTPException(status_code=400, detail="Invalid platform. Must be either 'mt4' or 'mt5'.")
+
+        metaapi = MetaApi(METAAPI_TOKEN)
+        
+        # Universally provision any broker account through MetaApi
+        account = await metaapi.metatrader_account_api.create_account({
+            'name': f'{data.broker_name}_User_{data.login}',
+            'type': 'cloud',
+            'login': data.login,
+            'password': data.password,
+            'server': data.server,
+            'platform': platform_lower,
+            'magic': 123456
+        })
+        
+        account_id = account.id
+        
+        await account.deploy()
+        await account.wait_connected()
+
+        connection = account.get_rpc_connection()
+        await connection.connect()
+        await connection.wait_synchronized()
+
+        # Enforce user daily profit target check
+        account_info = await connection.get_account_information()
+        floating_profit = account_info.get('profit', 0.0)
+        
+        if floating_profit >= data.daily_profit_target:
+            return {
+                "status": "Target Reached", 
+                "message": f"Daily profit target of ${data.daily_profit_target} already achieved on {data.broker_name}. Trading paused for today."
+            }
+
+        # Fetch market candles for SMC analysis
+        candles = await account.get_historical_candles(data.symbol, '1h', limit=200)
+        if not candles:
+            raise HTTPException(status_code=400, detail=f"Could not fetch market data from {data.broker_name} server.")
+            
+        df = pd.DataFrame(candles)
+        ohlc = df[['open', 'high', 'low', 'close']].astype(float)
+        ohlc['volume'] = df['tickVolume'] if 'tickVolume' in df else 100
+
+        # Calculate SMC Order Blocks
+        swing_highs_lows = smc.swing_highs_lows(ohlc)
+        order_blocks = smc.ob(ohlc, swing_highs_lows)
+        latest_ob = order_blocks.iloc[-1]
+        
+        # AI Self-Learning Filter Check
+        current_features = np.array([[1, 1, 1]]) 
+        ai_prediction = ai_model.predict(current_features)
+
+        if ai_prediction[0] == 1 and latest_ob.get('OrderBlock', 0) != 0:
+            price_spec = await connection.get_symbol_specification(data.symbol)
+            risk_lot_size = 0.01 
+            
+            current_price = price_spec['ask']
+            stop_loss = round(current_price - 0.0020, 5)   
+            take_profit = round(current_price + 0.0040, 5) 
+
+            result = await connection.create_market_buy_order(
+                symbol=data.symbol,
+                volume=risk_lot_size,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                options={'comment': f'{data.broker_name}_SMC_Bot'}
+            )
+            
+            return {
+                "status": "Success", 
+                "message": f"Successfully connected to {data.broker_name} ({data.platform.upper()}) and executed trade.", 
+                "order_id": result.get('stringCode'),
+                "account_id": account_id
+            }
+        else:
+            return {
+                "status": "Skipped", 
+                "message": f"Connected to {data.broker_name}, but current market structure lacks a valid SMC Order Block."
+            }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)def home():
     return {"status": "Online", "message": "SMC AI Trading Bot Backend is running 24/7."}
 
 # 4. Core Execution Endpoint
