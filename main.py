@@ -54,6 +54,10 @@ BOT_TASKS: Dict[str, asyncio.Task] = {}
 
 BOT_STATUS: Dict[str, dict] = {}
 
+# Analytics is kept in memory while the Railway service is running.
+# Closed-trade history is also requested from MetaApi when available.
+ANALYTICS_STATE: Dict[str, dict] = {}
+
 
 # ============================================================
 # REQUEST MODELS
@@ -585,6 +589,8 @@ async def connect_account_endpoint(
                 "last_error": None,
                 "last_results": []
             }
+
+        get_analytics_state(account_id)
 
         return {
             "status": "connected",
@@ -1224,6 +1230,11 @@ async def trading_loop(
                 result
             )
 
+            record_scan_analytics(
+                account_id,
+                result
+            )
+
             BOT_STATUS[
                 account_id
             ]["last_error"] = None
@@ -1490,12 +1501,248 @@ async def test_scan(
     account_id: str
 ):
 
-    return (
+    result = (
         await run_market_scan(
             account_id,
             dry_run=True
         )
     )
+
+    record_scan_analytics(
+        account_id,
+        result
+    )
+
+    return result
+
+
+
+
+# ============================================================
+# ANALYTICS HELPERS
+# ============================================================
+
+def get_analytics_state(account_id: str):
+    if account_id not in ANALYTICS_STATE:
+        ANALYTICS_STATE[account_id] = {
+            "decision_log": [],
+            "scan_history": []
+        }
+    return ANALYTICS_STATE[account_id]
+
+
+def _to_float(value, default=0.0):
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _read_value(item, key, default=None):
+    if isinstance(item, dict):
+        return item.get(key, default)
+    return getattr(item, key, default)
+
+
+def record_scan_analytics(account_id: str, result: dict):
+    state = get_analytics_state(account_id)
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    scan_record = {
+        "timestamp": timestamp,
+        "status": result.get("status"),
+        "account_profit": result.get("account_profit", 0),
+        "trades_opened": len(result.get("trades", [])),
+        "results": result.get("results", [])
+    }
+    state["scan_history"].append(scan_record)
+    state["scan_history"] = state["scan_history"][-500:]
+
+    for item in result.get("results", []):
+        entry = {
+            "timestamp": timestamp,
+            "symbol": item.get("symbol"),
+            "status": item.get("status"),
+            "signal": item.get("signal", "HOLD"),
+            "reason": item.get("reason"),
+            "source": "trading_engine"
+        }
+        state["decision_log"].append(entry)
+
+    state["decision_log"] = state["decision_log"][-1000:]
+
+
+async def get_closed_deals_for_analytics(connection, days: int):
+    """Fetch closed deal history from MetaApi when supported by the SDK."""
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=max(1, min(days, 365)))
+
+    try:
+        deals = await connection.get_deals_by_time_range(
+            start_time,
+            end_time,
+            0,
+            1000
+        )
+        return deals or []
+    except TypeError:
+        try:
+            deals = await connection.get_deals_by_time_range(
+                start_time,
+                end_time
+            )
+            return deals or []
+        except Exception:
+            return []
+    except Exception:
+        return []
+
+
+def build_analytics_response(account_id: str, deals: list, days: int):
+    normalized_deals = []
+
+    for deal in deals or []:
+        deal_type = str(_read_value(deal, "type", "")).upper()
+        entry_type = str(_read_value(deal, "entryType", _read_value(deal, "entry_type", ""))).upper()
+        profit = _to_float(_read_value(deal, "profit", 0))
+        commission = _to_float(_read_value(deal, "commission", 0))
+        swap = _to_float(_read_value(deal, "swap", 0))
+        total_profit = profit + commission + swap
+        time_value = _read_value(deal, "time", _read_value(deal, "brokerTime", None))
+
+        # Keep balance/credit operations out of trade statistics.
+        if "BALANCE" in deal_type or "CREDIT" in deal_type:
+            continue
+
+        # A deal with a symbol is considered trade-related. This keeps the
+        # route tolerant of different MetaApi SDK object formats.
+        symbol = _read_value(deal, "symbol", None)
+        if not symbol:
+            continue
+
+        normalized_deals.append({
+            "id": str(_read_value(deal, "id", _read_value(deal, "ticket", ""))),
+            "symbol": symbol,
+            "type": deal_type,
+            "entry_type": entry_type,
+            "profit": total_profit,
+            "time": time_value
+        })
+
+    # Deduplicate by deal id when the API returns repeated records.
+    unique = {}
+    for deal in normalized_deals:
+        unique[deal["id"] or f"{deal['symbol']}-{deal['time']}-{deal['profit']}"] = deal
+    normalized_deals = list(unique.values())
+
+    closed = [d for d in normalized_deals if d["profit"] != 0]
+    wins = [d for d in closed if d["profit"] > 0]
+    losses = [d for d in closed if d["profit"] < 0]
+
+    trade_count = len(closed)
+    win_count = len(wins)
+    loss_count = len(losses)
+    win_rate = round((win_count / trade_count) * 100, 2) if trade_count else 0.0
+
+    gross_profit = sum(d["profit"] for d in wins)
+    gross_loss = abs(sum(d["profit"] for d in losses))
+    avg_win = gross_profit / win_count if win_count else 0.0
+    avg_loss = gross_loss / loss_count if loss_count else 0.0
+    avg_rr = round(avg_win / avg_loss, 2) if avg_loss > 0 else 0.0
+
+    daily = {}
+    for deal in closed:
+        time_value = str(deal.get("time") or "unknown")
+        day = time_value[:10] if len(time_value) >= 10 else "unknown"
+        if day not in daily:
+            daily[day] = {"date": day, "wins": 0, "losses": 0, "profit": 0.0, "trades": 0}
+        daily[day]["trades"] += 1
+        daily[day]["profit"] += deal["profit"]
+        if deal["profit"] > 0:
+            daily[day]["wins"] += 1
+        elif deal["profit"] < 0:
+            daily[day]["losses"] += 1
+
+    state = get_analytics_state(account_id)
+    decision_log = state.get("decision_log", [])[-100:]
+
+    return {
+        "account_id": account_id,
+        "period_days": days,
+        "win_rate": win_rate,
+        "trades": trade_count,
+        "wins": win_count,
+        "losses": loss_count,
+        "avg_rr": avg_rr,
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
+        "net_profit": round(sum(d["profit"] for d in closed), 2),
+        "daily": sorted(daily.values(), key=lambda item: item["date"]),
+        "decision_log": decision_log,
+        "scan_history": state.get("scan_history", [])[-100:],
+        "message": (
+            "Analytics generated from MetaApi deal history and the current bot runtime log. "
+            "Decision history starts collecting after this service version is deployed."
+        )
+    }
+
+
+# ============================================================
+# ANALYTICS
+#
+# Supports both:
+#   GET /analytics?account_id=<id>&days=30
+#   GET /accounts/<account_id>/analytics?days=30
+# ============================================================
+
+@app.get("/analytics")
+async def get_analytics(
+    account_id: Optional[str] = None,
+    days: int = 30
+):
+    days = max(1, min(days, 365))
+
+    if account_id is None:
+        if BOT_CONFIGS:
+            account_id = next(iter(BOT_CONFIGS.keys()))
+        else:
+            return {
+                "account_id": None,
+                "period_days": days,
+                "win_rate": 0.0,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "avg_rr": 0.0,
+                "gross_profit": 0.0,
+                "gross_loss": 0.0,
+                "net_profit": 0.0,
+                "daily": [],
+                "decision_log": [],
+                "scan_history": [],
+                "message": "No account is configured in this Railway runtime yet. Connect the account first."
+            }
+
+    try:
+        metaapi = get_metaapi()
+        account = await get_account_by_id(metaapi, account_id)
+        connection = await connect_account(account)
+        deals = await get_closed_deals_for_analytics(connection, days)
+        return build_analytics_response(account_id, deals, days)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
+
+
+@app.get("/accounts/{account_id}/analytics")
+async def get_account_analytics(
+    account_id: str,
+    days: int = 30
+):
+    return await get_analytics(account_id=account_id, days=days)
 
 
 # ============================================================
