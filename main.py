@@ -1,7 +1,6 @@
 import os
-import asyncio
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional
+from typing import List
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
@@ -16,15 +15,9 @@ from metaapi_cloud_sdk import MetaApi
 # ============================================================
 
 app = FastAPI(
-    title="SMC AI Trading Bot - Multi-Pair",
-    version="5.0",
-    description="Multi-pair MetaTrader trading bot with market analysis."
+    title="AI Trading Bot",
+    version="5.1"
 )
-
-
-# ============================================================
-# CORS
-# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,38 +40,23 @@ METAAPI_TOKEN = os.getenv("METAAPI_TOKEN")
 # ============================================================
 
 class MultiPairSetup(BaseModel):
-    broker_name: str = Field(..., min_length=1)
-    platform: str = Field(..., min_length=2)
-    login: str = Field(..., min_length=1)
-    password: str = Field(..., min_length=1)
-    server: str = Field(..., min_length=1)
+    broker_name: str
+    platform: str
+    login: str
+    password: str
+    server: str
 
     symbols: List[str] = Field(
-        default_factory=lambda: [
-            "EURUSD",
-            "GBPUSD",
-            "USDJPY",
-            "XAUUSD"
-        ]
+        default_factory=lambda: ["EURUSD"]
     )
 
-    daily_profit_target: float = Field(
-        default=50.0,
-        gt=0
-    )
+    daily_profit_target: float = 50.0
 
-    risk_percent: float = Field(
-        default=1.0,
-        gt=0,
-        le=5
-    )
+    lot_size: float = 0.01
 
-    lot_size: float = Field(
-        default=0.01,
-        gt=0
-    )
-
-    dry_run: bool = False
+    # True = analyse only, no real order
+    # False = can send order to demo/live account
+    dry_run: bool = True
 
 
 # ============================================================
@@ -89,8 +67,7 @@ class MultiPairSetup(BaseModel):
 async def home():
     return {
         "status": "Online",
-        "message": "Multi-Pair Trading Engine Active",
-        "version": "5.0"
+        "message": "AI Trading Engine Active"
     }
 
 
@@ -100,9 +77,10 @@ async def home():
 
 @app.get("/health")
 async def health():
+
     return {
         "status": "healthy",
-        "metaapi_configured": bool(METAAPI_TOKEN),
+        "metaapi_token_configured": bool(METAAPI_TOKEN),
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
@@ -111,17 +89,10 @@ async def health():
 # MARKET ANALYSIS
 # ============================================================
 
-def analyse_market(candles: list):
-    """
-    Simple market structure and momentum analysis.
-
-    Returns:
-    BUY
-    SELL
-    HOLD
-    """
+def analyse_market(candles):
 
     if not candles or len(candles) < 50:
+
         return {
             "signal": "HOLD",
             "reason": "Not enough candle data"
@@ -130,6 +101,7 @@ def analyse_market(candles: list):
     rows = []
 
     for candle in candles:
+
         rows.append({
             "time": candle.get("time"),
             "open": float(candle.get("open", 0)),
@@ -141,12 +113,13 @@ def analyse_market(candles: list):
     df = pd.DataFrame(rows)
 
     if len(df) < 50:
+
         return {
             "signal": "HOLD",
             "reason": "Insufficient valid candles"
         }
 
-    # Moving averages
+    # Fast and slow trend averages
     df["ema_fast"] = df["close"].ewm(
         span=9,
         adjust=False
@@ -157,72 +130,50 @@ def analyse_market(candles: list):
         adjust=False
     ).mean()
 
-    # Recent highs and lows
-    recent = df.tail(20)
-
     current = df.iloc[-1]
     previous = df.iloc[-2]
 
-    current_price = current["close"]
+    bullish_trend = (
+        current["ema_fast"] > current["ema_slow"]
+    )
 
-    highest_recent = recent["high"].max()
-    lowest_recent = recent["low"].min()
+    bearish_trend = (
+        current["ema_fast"] < current["ema_slow"]
+    )
 
-    bullish_trend = current["ema_fast"] > current["ema_slow"]
-    bearish_trend = current["ema_fast"] < current["ema_slow"]
+    bullish_momentum = (
+        current["close"] > previous["close"]
+    )
 
-    bullish_momentum = current["close"] > previous["close"]
-    bearish_momentum = current["close"] < previous["close"]
+    bearish_momentum = (
+        current["close"] < previous["close"]
+    )
 
-    # --------------------------------------------------------
-    # BUY SIGNAL
-    # --------------------------------------------------------
-
+    # BUY
     if bullish_trend and bullish_momentum:
 
         return {
             "signal": "BUY",
-            "reason": (
-                "Bullish trend confirmed by fast EMA above slow EMA "
-                "and positive candle momentum"
-            ),
-            "price": current_price,
-            "recent_high": highest_recent,
-            "recent_low": lowest_recent
+            "reason": "Bullish trend and momentum detected"
         }
 
-    # --------------------------------------------------------
-    # SELL SIGNAL
-    # --------------------------------------------------------
-
+    # SELL
     if bearish_trend and bearish_momentum:
 
         return {
             "signal": "SELL",
-            "reason": (
-                "Bearish trend confirmed by fast EMA below slow EMA "
-                "and negative candle momentum"
-            ),
-            "price": current_price,
-            "recent_high": highest_recent,
-            "recent_low": lowest_recent
+            "reason": "Bearish trend and momentum detected"
         }
 
-    # --------------------------------------------------------
     # HOLD
-    # --------------------------------------------------------
-
     return {
         "signal": "HOLD",
-        "reason": "No clear market structure confirmation",
-        "price": current_price,
-        "recent_high": highest_recent,
-        "recent_low": lowest_recent
+        "reason": "No valid trading setup detected"
     }
 
 
 # ============================================================
-# GET OR CREATE METAAPI ACCOUNT
+# FIND EXISTING METAAPI ACCOUNT OR CREATE ONE
 # ============================================================
 
 async def get_or_create_account(
@@ -240,27 +191,79 @@ async def get_or_create_account(
 
     try:
 
-        account = await metaapi.metatrader_account_api.create_account({
-            "name": account_name,
-            "type": "cloud",
-            "login": str(login),
-            "password": password,
-            "server": server,
-            "platform": platform,
-            "magic": 123456
-        })
+        # ----------------------------------------------------
+        # GET ALL EXISTING METAAPI ACCOUNTS
+        # ----------------------------------------------------
+
+        accounts = (
+            await metaapi.metatrader_account_api.get_accounts()
+        )
+
+        # ----------------------------------------------------
+        # LOOK FOR MATCHING ACCOUNT
+        # ----------------------------------------------------
+
+        for account in accounts:
+
+            account_login = str(
+                getattr(account, "login", "")
+            )
+
+            account_server = str(
+                getattr(account, "server", "")
+            )
+
+            account_platform = str(
+                getattr(account, "platform", "")
+            ).lower()
+
+            if (
+                account_login == str(login)
+                and account_server == str(server)
+                and account_platform == str(platform).lower()
+            ):
+
+                print(
+                    f"Using existing MetaApi account: "
+                    f"{account.id}"
+                )
+
+                return account
+
+        # ----------------------------------------------------
+        # NO MATCH FOUND — CREATE ACCOUNT
+        # ----------------------------------------------------
+
+        print(
+            "No existing MetaApi account found. "
+            "Creating a new account."
+        )
+
+        account = (
+            await metaapi.metatrader_account_api.create_account({
+                "name": account_name,
+                "type": "cloud",
+                "login": str(login),
+                "password": password,
+                "server": server,
+                "platform": platform,
+                "magic": 123456
+            })
+        )
 
         return account
 
-    except Exception as create_error:
+    except Exception as error:
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                "Unable to create MetaAPI account. "
-                f"Check login, password, server and platform. "
-                f"Error: {str(create_error)}"
-            )
+            detail={
+                "message": (
+                    "Unable to find or create "
+                    "MetaApi account"
+                ),
+                "error": str(error)
+            }
         )
 
 
@@ -272,38 +275,40 @@ async def get_or_create_account(
 async def connect_and_trade(data: MultiPairSetup):
 
     # --------------------------------------------------------
-    # VALIDATE PLATFORM
-    # --------------------------------------------------------
-
-    platform = data.platform.lower().strip()
-
-    if platform not in ["mt4", "mt5"]:
-        raise HTTPException(
-            status_code=400,
-            detail="Platform must be mt4 or mt5"
-        )
-
-    # --------------------------------------------------------
-    # VALIDATE METAAPI TOKEN
+    # VALIDATE TOKEN
     # --------------------------------------------------------
 
     if not METAAPI_TOKEN:
 
         raise HTTPException(
             status_code=500,
-            detail=(
-                "METAAPI_TOKEN is not configured. "
-                "Add it to Railway Environment Variables."
-            )
+            detail="METAAPI_TOKEN is missing from Railway."
         )
 
     # --------------------------------------------------------
-    # CONNECT TO METAAPI
+    # VALIDATE PLATFORM
     # --------------------------------------------------------
+
+    platform = data.platform.lower().strip()
+
+    if platform not in ["mt4", "mt5"]:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Platform must be mt4 or mt5."
+        )
 
     try:
 
+        # ----------------------------------------------------
+        # CONNECT METAAPI
+        # ----------------------------------------------------
+
         metaapi = MetaApi(METAAPI_TOKEN)
+
+        # ----------------------------------------------------
+        # FIND OR CREATE ACCOUNT
+        # ----------------------------------------------------
 
         account = await get_or_create_account(
             metaapi=metaapi,
@@ -316,302 +321,353 @@ async def connect_and_trade(data: MultiPairSetup):
 
         account_id = account.id
 
-        # Deploy account
-        await account.deploy()
+        print(
+            f"MetaApi account selected: {account_id}"
+        )
 
-        # Wait for broker connection
+        # ----------------------------------------------------
+        # DEPLOY ONLY IF NECESSARY
+        # ----------------------------------------------------
+
+        account_state = str(
+            getattr(account, "state", "")
+        ).upper()
+
+        if account_state != "DEPLOYED":
+
+            print(
+                "Deploying MetaApi account..."
+            )
+
+            await account.deploy()
+
+        # ----------------------------------------------------
+        # WAIT FOR CONNECTION
+        # ----------------------------------------------------
+
+        print(
+            "Waiting for MetaTrader connection..."
+        )
+
         await account.wait_connected()
 
-        # Create RPC connection
+        # ----------------------------------------------------
+        # CREATE RPC CONNECTION
+        # ----------------------------------------------------
+
         connection = account.get_rpc_connection()
 
         await connection.connect()
 
         await connection.wait_synchronized()
 
-    except Exception as connection_error:
-
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": "Failed to connect to MetaTrader account",
-                "error": str(connection_error)
-            }
+        print(
+            "MetaTrader account synchronized."
         )
 
-    # ========================================================
-    # ACCOUNT INFORMATION
-    # ========================================================
-
-    try:
+        # ----------------------------------------------------
+        # GET ACCOUNT INFORMATION
+        # ----------------------------------------------------
 
         account_information = (
             await connection.get_account_information()
         )
 
-    except Exception as account_error:
-
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": "Connected but unable to retrieve account information",
-                "error": str(account_error)
-            }
+        account_profit = float(
+            account_information.get("profit", 0)
         )
 
-    # ========================================================
-    # DAILY PROFIT CHECK
-    # ========================================================
+        # ----------------------------------------------------
+        # DAILY PROFIT TARGET CHECK
+        # ----------------------------------------------------
 
-    floating_profit = float(
-        account_information.get("profit", 0)
-    )
+        if (
+            account_profit >=
+            data.daily_profit_target
+        ):
 
-    if floating_profit >= data.daily_profit_target:
+            return {
+                "status": "target_reached",
+                "message": (
+                    "Daily profit target reached. "
+                    "No new trades opened."
+                ),
+                "account_id": account_id,
+                "profit": account_profit
+            }
 
-        return {
-            "status": "target_reached",
-            "message": (
-                f"Profit target of "
-                f"${data.daily_profit_target} reached. "
-                f"Trading is paused."
-            ),
-            "profit": floating_profit,
-            "account_id": account_id
-        }
+        # ====================================================
+        # SCAN SYMBOLS
+        # ====================================================
 
-    # ========================================================
-    # RESULTS
-    # ========================================================
+        results = []
 
-    results = []
+        executed_trades = []
 
-    executed_trades = []
+        for symbol in data.symbols:
 
-    # ========================================================
-    # SCAN SYMBOLS
-    # ========================================================
+            symbol = symbol.strip()
 
-    for symbol in data.symbols:
+            try:
 
-        symbol = symbol.strip()
-
-        try:
-
-            # ------------------------------------------------
-            # GET HISTORICAL CANDLES
-            # ------------------------------------------------
-
-            start_time = (
-                datetime.now(timezone.utc)
-                - timedelta(hours=250)
-            )
-
-            candles = await connection.get_candles(
-                symbol,
-                "1h",
-                start_time,
-                200
-            )
-
-            if not candles:
-
-                results.append({
-                    "symbol": symbol,
-                    "status": "skipped",
-                    "reason": "No candle data returned"
-                })
-
-                continue
-
-            # ------------------------------------------------
-            # ANALYSE MARKET
-            # ------------------------------------------------
-
-            analysis = analyse_market(candles)
-
-            signal = analysis["signal"]
-
-            # ------------------------------------------------
-            # NO TRADE
-            # ------------------------------------------------
-
-            if signal == "HOLD":
-
-                results.append({
-                    "symbol": symbol,
-                    "status": "skipped",
-                    "signal": signal,
-                    "reason": analysis["reason"]
-                })
-
-                continue
-
-            # ------------------------------------------------
-            # GET LIVE PRICE
-            # ------------------------------------------------
-
-            price = await connection.get_symbol_price(
-                symbol
-            )
-
-            ask = float(price.get("ask", 0))
-            bid = float(price.get("bid", 0))
-
-            if ask <= 0 or bid <= 0:
-
-                results.append({
-                    "symbol": symbol,
-                    "status": "error",
-                    "reason": "Invalid live price returned"
-                })
-
-                continue
-
-            # =================================================
-            # BUY
-            # =================================================
-
-            if signal == "BUY":
-
-                entry_price = ask
-
-                # 0.5% stop loss
-                stop_loss = (
-                    entry_price * 0.995
+                print(
+                    f"Scanning symbol: {symbol}"
                 )
 
-                # 1% take profit
-                take_profit = (
-                    entry_price * 1.01
+                # ------------------------------------------------
+                # GET CANDLES
+                # ------------------------------------------------
+
+                start_time = (
+                    datetime.now(timezone.utc)
+                    - timedelta(hours=250)
                 )
 
-            # =================================================
-            # SELL
-            # =================================================
-
-            elif signal == "SELL":
-
-                entry_price = bid
-
-                # 0.5% stop loss
-                stop_loss = (
-                    entry_price * 1.005
+                candles = (
+                    await connection.get_candles(
+                        symbol,
+                        "1h",
+                        start_time,
+                        200
+                    )
                 )
 
-                # 1% take profit
-                take_profit = (
-                    entry_price * 0.99
+                if not candles:
+
+                    results.append({
+                        "symbol": symbol,
+                        "status": "error",
+                        "reason": (
+                            "No candle data returned."
+                        )
+                    })
+
+                    continue
+
+                # ------------------------------------------------
+                # ANALYSE MARKET
+                # ------------------------------------------------
+
+                analysis = analyse_market(
+                    candles
                 )
 
-            # ------------------------------------------------
-            # DRY RUN
-            # ------------------------------------------------
+                signal = analysis["signal"]
 
-            if data.dry_run:
+                # ------------------------------------------------
+                # HOLD
+                # ------------------------------------------------
 
-                results.append({
+                if signal == "HOLD":
+
+                    results.append({
+                        "symbol": symbol,
+                        "status": "skipped",
+                        "signal": signal,
+                        "reason": analysis["reason"]
+                    })
+
+                    continue
+
+                # ------------------------------------------------
+                # GET LIVE PRICE
+                # ------------------------------------------------
+
+                price = (
+                    await connection.get_symbol_price(
+                        symbol
+                    )
+                )
+
+                ask = float(
+                    price.get("ask", 0)
+                )
+
+                bid = float(
+                    price.get("bid", 0)
+                )
+
+                if ask <= 0 or bid <= 0:
+
+                    results.append({
+                        "symbol": symbol,
+                        "status": "error",
+                        "reason": (
+                            "Invalid market price returned."
+                        )
+                    })
+
+                    continue
+
+                # ------------------------------------------------
+                # CALCULATE BUY LEVELS
+                # ------------------------------------------------
+
+                if signal == "BUY":
+
+                    entry_price = ask
+
+                    stop_loss = (
+                        entry_price * 0.995
+                    )
+
+                    take_profit = (
+                        entry_price * 1.01
+                    )
+
+                # ------------------------------------------------
+                # CALCULATE SELL LEVELS
+                # ------------------------------------------------
+
+                elif signal == "SELL":
+
+                    entry_price = bid
+
+                    stop_loss = (
+                        entry_price * 1.005
+                    )
+
+                    take_profit = (
+                        entry_price * 0.99
+                    )
+
+                # ------------------------------------------------
+                # DRY RUN
+                # ------------------------------------------------
+
+                if data.dry_run:
+
+                    results.append({
+                        "symbol": symbol,
+                        "status": "simulation",
+                        "signal": signal,
+                        "entry_price": entry_price,
+                        "stop_loss": stop_loss,
+                        "take_profit": take_profit,
+                        "reason": analysis["reason"]
+                    })
+
+                    continue
+
+                # =================================================
+                # EXECUTE BUY
+                # =================================================
+
+                if signal == "BUY":
+
+                    order_result = (
+                        await connection.create_market_buy_order(
+                            symbol,
+                            data.lot_size,
+                            stop_loss,
+                            take_profit,
+                            {
+                                "comment": (
+                                    "AI_TRADING_BOT_BUY"
+                                )
+                            }
+                        )
+                    )
+
+                # =================================================
+                # EXECUTE SELL
+                # =================================================
+
+                elif signal == "SELL":
+
+                    order_result = (
+                        await connection.create_market_sell_order(
+                            symbol,
+                            data.lot_size,
+                            stop_loss,
+                            take_profit,
+                            {
+                                "comment": (
+                                    "AI_TRADING_BOT_SELL"
+                                )
+                            }
+                        )
+                    )
+
+                # ------------------------------------------------
+                # RECORD RESULT
+                # ------------------------------------------------
+
+                trade = {
                     "symbol": symbol,
-                    "status": "simulation",
                     "signal": signal,
                     "entry_price": entry_price,
                     "stop_loss": stop_loss,
                     "take_profit": take_profit,
+                    "order_result": order_result
+                }
+
+                executed_trades.append(
+                    trade
+                )
+
+                results.append({
+                    "symbol": symbol,
+                    "status": "trade_executed",
+                    "signal": signal,
                     "reason": analysis["reason"]
                 })
 
-                continue
+            # ====================================================
+            # SHOW REAL ERRORS
+            # ====================================================
 
-            # =================================================
-            # EXECUTE BUY
-            # =================================================
+            except Exception as symbol_error:
 
-            if signal == "BUY":
-
-                order_result = (
-                    await connection.create_market_buy_order(
-                        symbol,
-                        data.lot_size,
-                        stop_loss,
-                        take_profit,
-                        {
-                            "comment": "SMC_AI_BOT_BUY"
-                        }
-                    )
+                print(
+                    f"ERROR processing "
+                    f"{symbol}: {str(symbol_error)}"
                 )
 
-            # =================================================
-            # EXECUTE SELL
-            # =================================================
+                results.append({
+                    "symbol": symbol,
+                    "status": "error",
+                    "reason": str(symbol_error)
+                })
 
-            elif signal == "SELL":
-
-                order_result = (
-                    await connection.create_market_sell_order(
-                        symbol,
-                        data.lot_size,
-                        stop_loss,
-                        take_profit,
-                        {
-                            "comment": "SMC_AI_BOT_SELL"
-                        }
-                    )
-                )
-
-            trade = {
-                "symbol": symbol,
-                "signal": signal,
-                "entry_price": entry_price,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
-                "order_result": order_result
-            }
-
-            executed_trades.append(trade)
-
-            results.append({
-                "symbol": symbol,
-                "status": "trade_executed",
-                "signal": signal,
-                "reason": analysis["reason"]
-            })
-
-        except Exception as symbol_error:
-
-            # IMPORTANT:
-            # We now show the actual error instead of silently
-            # hiding it.
-
-            results.append({
-                "symbol": symbol,
-                "status": "error",
-                "reason": str(symbol_error)
-            })
-
-    # ========================================================
-    # FINAL RESPONSE
-    # ========================================================
-
-    if executed_trades:
+        # ========================================================
+        # FINAL RESPONSE
+        # ========================================================
 
         return {
-            "status": "success",
+            "status": (
+                "success"
+                if executed_trades
+                else "completed"
+            ),
             "message": (
-                "Market scan completed and one or more "
-                "trades were executed."
+                "Trade scan completed."
+                if executed_trades
+                else "Market scan completed. "
+                     "No trades were executed."
             ),
             "account_id": account_id,
-            "account_profit": floating_profit,
+            "account_profit": account_profit,
             "trades": executed_trades,
             "results": results
         }
 
-    return {
-        "status": "completed",
-        "message": (
-            "Market scan completed. No trades were executed."
-        ),
-        "account_id": account_id,
-        "account_profit": floating_profit,
-        "results": results
-    }
+    except HTTPException:
+
+        raise
+
+    except Exception as error:
+
+        print(
+            f"CONNECTION ERROR: {str(error)}"
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": (
+                    "Trading engine failed."
+                ),
+                "error": str(error)
+            }
+        )
