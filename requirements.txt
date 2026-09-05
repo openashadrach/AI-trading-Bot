@@ -1,7 +1,5 @@
 fastapi
 uvicorn
-pandas
-numpy
 metaapi-cloud-sdk
-smartmoneyconcepts
-scikit-learn
+pandas
+pydantic
