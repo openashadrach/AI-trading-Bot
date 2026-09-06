@@ -1690,6 +1690,163 @@ def build_analytics_response(account_id: str, deals: list, days: int):
 
 
 # ============================================================
+# ============================================================
+# HOME DASHBOARD COMPATIBILITY ROUTES
+# ============================================================
+
+@app.get("/status")
+async def get_status():
+
+    if not BOT_CONFIGS:
+        return {
+            "status": "running",
+            "trading_active": False,
+            "connected": False,
+            "account_id": None,
+            "message": "Bot service is running. No account is currently connected."
+        }
+
+    account_id = next(iter(BOT_CONFIGS.keys()))
+
+    bot_status = BOT_STATUS.get(
+        account_id,
+        {
+            "trading_active": False,
+            "last_scan": None,
+            "last_error": None,
+            "last_results": []
+        }
+    )
+
+    return {
+        "status": "running",
+        "connected": True,
+        "account_id": account_id,
+        "trading_active": bot_status.get(
+            "trading_active",
+            False
+        ),
+        "last_scan": bot_status.get(
+            "last_scan"
+        ),
+        "last_error": bot_status.get(
+            "last_error"
+        )
+    }
+
+
+@app.get("/account")
+async def get_current_account():
+
+    if not BOT_CONFIGS:
+        return {
+            "connected": False,
+            "account_id": None,
+            "balance": 0,
+            "equity": 0,
+            "profit": 0,
+            "currency": None,
+            "message": (
+                "No account is configured in this Railway runtime."
+            )
+        }
+
+    account_id = next(iter(BOT_CONFIGS.keys()))
+
+    try:
+
+        metaapi = get_metaapi()
+
+        account = await get_account_by_id(
+            metaapi,
+            account_id
+        )
+
+        connection = await connect_account(
+            account
+        )
+
+        account_information = (
+            await connection.get_account_information()
+        )
+
+        return {
+            "connected": True,
+            "account_id": account_id,
+            "balance": account_information.get(
+                "balance",
+                0
+            ),
+            "equity": account_information.get(
+                "equity",
+                0
+            ),
+            "profit": account_information.get(
+                "profit",
+                0
+            ),
+            "currency": account_information.get(
+                "currency"
+            )
+        }
+
+    except Exception as error:
+
+        return {
+            "connected": False,
+            "account_id": account_id,
+            "balance": 0,
+            "equity": 0,
+            "profit": 0,
+            "currency": None,
+            "message": (
+                "Broker data is currently unavailable."
+            ),
+            "error": str(error)
+        }
+
+
+@app.get("/trades")
+async def get_trades():
+
+    if not BOT_CONFIGS:
+        return {
+            "account_id": None,
+            "count": 0,
+            "trades": []
+        }
+
+    account_id = next(iter(BOT_CONFIGS.keys()))
+
+    bot_status = BOT_STATUS.get(
+        account_id,
+        {}
+    )
+
+    last_results = bot_status.get(
+        "last_results",
+        []
+    )
+
+    executed_trades = []
+
+    for result in last_results:
+
+        if result.get("status") in [
+            "executed",
+            "opened",
+            "success"
+        ]:
+
+            executed_trades.append(
+                result
+            )
+
+    return {
+        "account_id": account_id,
+        "count": len(executed_trades),
+        "trades": executed_trades
+    }
 # ANALYTICS
 #
 # Supports both:
